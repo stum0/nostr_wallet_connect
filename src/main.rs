@@ -1,15 +1,19 @@
+use std::env;
 use std::str::FromStr;
 
-use nostr::prelude::{decrypt, encrypt, hex, FromBech32};
+use nostr::nips::nip47::NostrWalletConnectURI;
+use url::Url;
+use zebedee_rust::ln_address::{fetch_charge_ln_address, LnFetchCharge};
+use zebedee_rust::ZebedeeClient;
+
+use nostr::prelude::{decrypt, encrypt};
 use nostr::secp256k1::{KeyPair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
 use nostr::{
-    ClientMessage, Event, EventId, Filter, Keys, Kind, RelayMessage, Result, SubscriptionId, Tag,
-    Timestamp, Url,
+    ClientMessage, Event, EventId, Filter, Kind, RelayMessage, Result, SubscriptionId, Tag,
+    Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use tungstenite::{connect, Message as WsMessage};
-
-const WS_ENDPOINT: &str = "wss://relay.getalby.com/v1";
 
 #[derive(Serialize, Deserialize)]
 pub struct Params {
@@ -30,27 +34,52 @@ impl PayInvoiceRequest {
         }
     }
 }
-
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
+
+    let nwc_uri: String = env::var("NWC_URI").expect("NO NWC_URI ENV_VAR");
+    let apikey: String = env::var("ZBD_API_KEY").expect("NO ZBD_API_KEY ENV_VAR");
+
+    println!("API_KEY: {}", apikey);
+
+    println!("NWC_URI: {}", nwc_uri);
+
+    let uri = Url::parse(&nwc_uri).expect("Failed to parse URL");
+
+    let relay = uri
+        .query_pairs()
+        .find(|(key, _)| key == "relay")
+        .map(|(_, value)| value.into_owned())
+        .expect("Failed to get relay");
+
+    let secret = uri
+        .query_pairs()
+        .find(|(key, _)| key == "secret")
+        .map(|(_, value)| value.into_owned())
+        .expect("Failed to get secret");
+
+    let lud16 = uri
+        .query_pairs()
+        .find(|(key, _)| key == "lud16")
+        .map(|(_, value)| value.into_owned())
+        .expect("Failed to get lud16");
+
+    let public_key = uri.host().unwrap().to_string();
+
+    let nwc_service_pubkey = XOnlyPublicKey::from_str(public_key.as_str()).unwrap();
+    let secret = SecretKey::from_str(&secret).unwrap();
+    let relay_url = Url::parse(&relay).unwrap();
+
+    let nwc = NostrWalletConnectURI::new(nwc_service_pubkey, relay_url, Some(secret), Some(lud16))
+        .unwrap();
 
     let secp = Secp256k1::new();
 
-    let (mut socket, _response) =
-        connect(Url::parse(WS_ENDPOINT)?).expect("Can't connect to relay");
+    let (mut socket, _response) = connect(Url::parse(&relay)?).expect("Can't connect to relay");
 
-    //let nostr_keys = Keys::generate();
-
-    let nwc_secret =
-        SecretKey::from_str("1b5cd6b8c358900f727afbb53835005daf2182bb7d3f5e9c17135c8d7e5b94f5")
-            .unwrap();
-    println!("key: {:?}", nwc_secret.display_secret());
-    let nwc_key_pair = KeyPair::from_secret_key(&secp, &nwc_secret);
+    let nwc_key_pair = KeyPair::from_secret_key(&secp, &nwc.secret);
     let nwc_pubkey = XOnlyPublicKey::from_keypair(&nwc_key_pair);
-    let nwc_service_pubkey = XOnlyPublicKey::from_str(
-        "69effe7b49a6dd5cf525bd0905917a5005ffe480b58eeb8e861418cf3ae760d9",
-    )
-    .unwrap();
 
     //sub
     let id = uuid::Uuid::new_v4();
@@ -65,65 +94,54 @@ fn main() -> Result<()> {
     println!("Subscribing to relay");
     socket.write_message(WsMessage::Text(subscribe.as_json()))?;
 
-    //info
-    // let created_at = Timestamp::now();
-    // let kind = Kind::WalletConnectInfo;
-
-    // let tags = vec![];
-
-    // let content = "pay_invoice".to_string();
-
-    // let id = EventId::new(&nwc_pubkey.0, created_at, &kind, &tags, &content);
-
-    // let id_bytes = id.as_bytes();
-    // let sig = Message::from_slice(id_bytes).unwrap();
-
-    // let event = Event {
-    //     id,
-    //     kind,
-    //     content,
-    //     pubkey: nwc_pubkey.0,
-    //     created_at,
-    //     tags,
-    //     sig: nwc_key_pair.sign_schnorr(sig),
-    // };
-
-    // let nwc_info = ClientMessage::new_event(event);
-
-    // socket.write_message(WsMessage::Text(nwc_info.as_json()))?;
-    // println!("sending info to relay");
-
     //pay
 
-    let request = PayInvoiceRequest::new("lnbc1u1pj8vmh6pp54z34u28xgyxacpcyt0rm9wlx32symzdnkq53zs2pn36d6d6ayrgqdqqcqpjsp5nj8vfa4pejgsz0ptlk5ezhhppjdhv992pet49m6nafagukwg2s7q9q7sqqqqqqqqqqqqqqqqqqqsqqqqqysgqmqz9gxqyjw5qrzjqwryaup9lh50kkranzgcdnn2fgvx390wgj5jd07rwr3vxeje0glclla0meput24vfyqqqqlgqqqqqeqqjqlmkayjje8npjja2l6gnjec9lj5cszv7s7h26j4uzpd80qtlf2vxpkpyes43xn8nuylmphje0duy5muvllkrps3yv9szehc9fzh06kxgpz9mcxn".to_string());
+    let zebedee_client = ZebedeeClient::new().apikey(apikey).build();
 
-    let created_at = Timestamp::now();
-    let kind = Kind::WalletConnectRequest;
-
-    let tags = vec![Tag::PubKey(nwc_service_pubkey, None)];
-
-    let request_bytes = serde_json::to_vec(&request).unwrap();
-    let content = encrypt(&nwc_secret, &nwc_service_pubkey, &request_bytes).unwrap();
-
-    let id = EventId::new(&nwc_pubkey.0, created_at, &kind, &tags, &content);
-
-    let id_bytes = id.as_bytes();
-    let sig = Message::from_slice(id_bytes).unwrap();
-
-    let pay_event = Event {
-        id,
-        kind,
-        content,
-        pubkey: nwc_pubkey.0,
-        created_at,
-        tags,
-        sig: nwc_key_pair.sign_schnorr(sig),
+    let payment = LnFetchCharge {
+        ln_address: "stutxo@zbd.gg".to_string(),
+        amount: "1000".to_string(),
+        description: "nwc_test".to_string(),
     };
+    let invoice = fetch_charge_ln_address(zebedee_client, payment)
+        .await
+        .unwrap();
 
-    let nwc_pay = ClientMessage::new_event(pay_event);
+    if let Some(ln_fetch_charge_data) = invoice.data {
+        let invoice = ln_fetch_charge_data.invoice;
+        println!("invoice: {:?}", invoice.request);
+        let request = PayInvoiceRequest::new(invoice.request);
 
-    socket.write_message(WsMessage::Text(nwc_pay.as_json()))?;
-    println!("sending invoice to relay");
+        let created_at = Timestamp::now();
+        let kind = Kind::WalletConnectRequest;
+
+        let tags = vec![Tag::PubKey(nwc_service_pubkey, None)];
+
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+        let content = encrypt(&nwc.secret, &nwc_service_pubkey, &request_bytes).unwrap();
+
+        let id = EventId::new(&nwc_pubkey.0, created_at, &kind, &tags, &content);
+
+        let id_bytes = id.as_bytes();
+        let sig = Message::from_slice(id_bytes).unwrap();
+
+        let pay_event = Event {
+            id,
+            kind,
+            content,
+            pubkey: nwc_pubkey.0,
+            created_at,
+            tags,
+            sig: nwc_key_pair.sign_schnorr(sig),
+        };
+
+        let nwc_pay = ClientMessage::new_event(pay_event);
+
+        socket.write_message(WsMessage::Text(nwc_pay.as_json()))?;
+        println!("sending invoice to relay");
+    } else {
+        println!("No invoice found");
+    }
 
     loop {
         let msg = socket.read_message().expect("Error reading message");
