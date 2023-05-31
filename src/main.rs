@@ -34,9 +34,22 @@ impl PayInvoiceRequest {
         }
     }
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 3 {
+        println!("Please provide an ln_address as the first argument.");
+    }
+
+    let ln_address = &args[1];
+    let amount_in_sats: i64 = args[2]
+        .parse()
+        .expect("Invalid amount. Please enter a number.");
+    let amount_in_millisats = amount_in_sats * 1000;
 
     let nwc_uri: String = env::var("NWC_URI").expect("NO NWC_URI ENV_VAR");
     let apikey: String = env::var("ZBD_API_KEY").expect("NO ZBD_API_KEY ENV_VAR");
@@ -95,12 +108,11 @@ async fn main() -> Result<()> {
     socket.write_message(WsMessage::Text(subscribe.as_json()))?;
 
     //pay
-
     let zebedee_client = ZebedeeClient::new().apikey(apikey).build();
 
     let payment = LnFetchCharge {
-        ln_address: "stutxo@zbd.gg".to_string(),
-        amount: "1000".to_string(),
+        ln_address: ln_address.clone(),
+        amount: amount_in_millisats.to_string(),
         description: "nwc_test".to_string(),
     };
     let invoice = fetch_charge_ln_address(zebedee_client, payment)
@@ -170,7 +182,10 @@ async fn main() -> Result<()> {
                 } => {
                     let event =
                         decrypt(&nwc_key_pair.secret_key(), &event.pubkey, &event.content).unwrap();
+
+                    //add a match here to handle the different types of events
                     println!("{:#?}", event);
+                    return Ok(());
                 }
                 _ => (),
             }
