@@ -1,10 +1,11 @@
 use std::env;
 use std::str::FromStr;
 
+use email_address::EmailAddress;
 use nostr::nips::nip47::NostrWalletConnectURI;
+use serde::de::Error;
+use serde_json::Value;
 use url::Url;
-use zebedee_rust::ln_address::{fetch_charge_ln_address, LnFetchCharge};
-use zebedee_rust::ZebedeeClient;
 
 use nostr::prelude::{decrypt, encrypt};
 use nostr::secp256k1::{KeyPair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
@@ -52,9 +53,6 @@ async fn main() -> Result<()> {
     let amount_in_millisats = amount_in_sats * 1000;
 
     let nwc_uri: String = env::var("NWC_URI").expect("NO NWC_URI ENV_VAR");
-    let apikey: String = env::var("ZBD_API_KEY").expect("NO ZBD_API_KEY ENV_VAR");
-
-    println!("API_KEY: {}", apikey);
 
     println!("NWC_URI: {}", nwc_uri);
 
@@ -108,52 +106,71 @@ async fn main() -> Result<()> {
     socket.write_message(WsMessage::Text(subscribe.as_json()))?;
 
     //pay
-    let zebedee_client = ZebedeeClient::new().apikey(apikey).build();
+    let ln_address = LightningAddress::new(ln_address).unwrap();
+    let ln_url = ln_address.lnurlp_url();
 
-    let payment = LnFetchCharge {
-        ln_address: ln_address.clone(),
-        amount: amount_in_millisats.to_string(),
-        description: "nwc_test".to_string(),
+    let ln_address_res = reqwest::get(ln_url).await?;
+
+    println!(
+        "LN Address Response: {:?} {}",
+        ln_address_res.version(),
+        ln_address_res.status()
+    );
+
+    let body = ln_address_res.text().await?;
+
+    let ln_response: LnService = serde_json::from_str(&body).unwrap();
+
+    println!("callback address {:?}", ln_response.callback);
+
+    let callback = format!("{}?amount={}", ln_response.callback, amount_in_millisats,);
+
+    let invoice_res = reqwest::get(callback).await?;
+
+    println!(
+        "Invoice Response: {:?} {}",
+        invoice_res.version(),
+        invoice_res.status()
+    );
+
+    let body = invoice_res.text().await?;
+
+    let value: Value = serde_json::from_str(&body)?;
+    let invoice = value["pr"]
+        .as_str()
+        .ok_or_else(|| serde_json::Error::custom("Missing pr field"))?;
+
+    println!("Invoice: {}", invoice);
+
+    let request = PayInvoiceRequest::new(invoice.to_string());
+
+    let created_at = Timestamp::now();
+    let kind = Kind::WalletConnectRequest;
+
+    let tags = vec![Tag::PubKey(nwc_service_pubkey, None)];
+
+    let request_bytes = serde_json::to_vec(&request).unwrap();
+    let content = encrypt(&nwc.secret, &nwc_service_pubkey, &request_bytes).unwrap();
+
+    let id = EventId::new(&nwc_pubkey.0, created_at, &kind, &tags, &content);
+
+    let id_bytes = id.as_bytes();
+    let sig = Message::from_slice(id_bytes).unwrap();
+
+    let pay_event = Event {
+        id,
+        kind,
+        content,
+        pubkey: nwc_pubkey.0,
+        created_at,
+        tags,
+        sig: nwc_key_pair.sign_schnorr(sig),
     };
-    let invoice = fetch_charge_ln_address(zebedee_client, payment)
-        .await
-        .unwrap();
 
-    if let Some(ln_fetch_charge_data) = invoice.data {
-        let invoice = ln_fetch_charge_data.invoice;
-        println!("invoice: {:?}", invoice.request);
-        let request = PayInvoiceRequest::new(invoice.request);
+    let nwc_pay = ClientMessage::new_event(pay_event);
 
-        let created_at = Timestamp::now();
-        let kind = Kind::WalletConnectRequest;
-
-        let tags = vec![Tag::PubKey(nwc_service_pubkey, None)];
-
-        let request_bytes = serde_json::to_vec(&request).unwrap();
-        let content = encrypt(&nwc.secret, &nwc_service_pubkey, &request_bytes).unwrap();
-
-        let id = EventId::new(&nwc_pubkey.0, created_at, &kind, &tags, &content);
-
-        let id_bytes = id.as_bytes();
-        let sig = Message::from_slice(id_bytes).unwrap();
-
-        let pay_event = Event {
-            id,
-            kind,
-            content,
-            pubkey: nwc_pubkey.0,
-            created_at,
-            tags,
-            sig: nwc_key_pair.sign_schnorr(sig),
-        };
-
-        let nwc_pay = ClientMessage::new_event(pay_event);
-
-        socket.write_message(WsMessage::Text(nwc_pay.as_json()))?;
-        println!("sending invoice to relay");
-    } else {
-        println!("No invoice found");
-    }
+    socket.write_message(WsMessage::Text(nwc_pay.as_json()))?;
+    println!("sending invoice to relay");
 
     loop {
         let msg = socket.read_message().expect("Error reading message");
@@ -193,4 +210,57 @@ async fn main() -> Result<()> {
             println!("Received unexpected message: {}", msg_text);
         }
     }
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct LightningAddress {
+    value: EmailAddress,
+}
+
+impl LightningAddress {
+    pub fn new(value: &str) -> Result<Self> {
+        EmailAddress::from_str(value)
+            .map(|value| LightningAddress { value })
+            .map_err(|_| "Invalid email address".into())
+    }
+
+    #[inline]
+    pub fn lnurlp_url(&self) -> String {
+        format!(
+            "https://{}/.well-known/lnurlp/{}",
+            self.value.domain(),
+            self.value.local_part()
+        )
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PayerData {
+    pub name: Option<Mandatory>,
+    pub identifier: Option<Mandatory>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Mandatory {
+    pub mandatory: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct LnService {
+    #[serde(rename = "minSendable")]
+    pub min_sendable: u64,
+    #[serde(rename = "maxSendable")]
+    pub max_sendable: u64,
+    #[serde(rename = "commentAllowed")]
+    pub comment_allowed: Option<u64>,
+    pub tag: String,
+    pub metadata: String,
+    pub callback: String,
+    #[serde(rename = "payerData")]
+    pub payer_data: Option<PayerData>,
+    pub disposable: Option<bool>,
+    #[serde(rename = "allowsNostr")]
+    pub allows_nostr: Option<bool>,
+    #[serde(rename = "nostrPubkey")]
+    pub nostr_pubkey: Option<String>,
 }
